@@ -1,0 +1,128 @@
+[
+  {
+    "name": "lightgbm_seed42",
+    "trained": true,
+    "validation": {
+      "mean_total": 10.17994435929306,
+      "std_total": 0.912089871641763,
+      "weighted_total": 10.16771771700072
+    },
+    "top_features": [
+      "weight",
+      "utl_exp_ppp17",
+      "utl_exp_per_person",
+      "age",
+      "food_diversity",
+      "educ_max",
+      "sector1d",
+      "strata",
+      "workers_per_adult",
+      "hsize"
+    ]
+  },
+  {
+    "name": "xgboost_seed42",
+    "trained": true,
+    "validation": {
+      "mean_total": 10.148942681365748,
+      "std_total": 0.9706921095170707,
+      "weighted_total": 10.12974359642313
+    },
+    "top_features": [
+      "high_strata",
+      "urban",
+      "log_utl_exp_per_person",
+      "utl_exp_per_person",
+      "any_formal_worker",
+      "strata",
+      "sfworkershh",
+      "hsize_squared",
+      "region5",
+      "consumed4700"
+    ]
+  },
+  {
+    "name": "catboost_seed42",
+    "trained": true,
+    "validation": {
+      "mean_total": 9.144558913688849,
+      "std_total": 1.0257960302493672,
+      "weighted_total": 9.122129149574304
+    },
+    "top_features": [
+      "log_utl_exp_per_person",
+      "utl_exp_per_person",
+      "sfworkershh",
+      "educ_max",
+      "strata",
+      "food_diversity",
+      "hsize_squared",
+      "food_diversity_ratio",
+      "any_formal_worker",
+      "high_strata"
+    ]
+  },
+  {
+    "name": "lightgbm_seed123",
+    "trained": true,
+    "validation": {
+      "mean_total": 10.110882646207218,
+      "std_total": 0.9465689968288076,
+      "weighted_total": 10.09122034479971
+    },
+    "top_features": [
+      "weight",
+      "utl_exp_ppp17",
+      "utl_exp_per_person",
+      "age",
+      "food_diversity",
+      "educ_max",
+      "sector1d",
+      "workers_per_adult",
+      "strata",
+      "sfworkershh"
+    ]
+  },
+  {
+    "name": "xgboost_seed123",
+    "trained": true,
+    "validation": {
+      "mean_total": 10.08433347424223,
+      "std_total": 1.106298829394442,
+      "weighted_total": 10.062397611472711
+    },
+    "top_features": [
+      "urban",
+      "utl_exp_per_person",
+      "strata",
+      "log_utl_exp_per_person",
+      "any_formal_worker",
+      "sfworkershh",
+      "hsize",
+      "consumed2600",
+      "sewer",
+      "region5"
+    ]
+  },
+  {
+    "name": "catboost_seed123",
+    "trained": true,
+    "validation": {
+      "mean_total": 9.19415716704566,
+      "std_total": 1.0683241780642045,
+      "weighted_total": 9.173055467253697
+    },
+    "top_features": [
+      "utl_exp_per_person",
+      "log_utl_exp_per_person",
+      "sfworkershh",
+      "educ_max",
+      "food_diversity_ratio",
+      "any_formal_worker",
+      "region5",
+      "strata",
+      "food_diversity",
+      "hsize"
+    ]
+  }
+]
