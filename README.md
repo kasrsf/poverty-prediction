@@ -8,6 +8,8 @@ This project tackles a poverty prediction competition that simulates a real-worl
 
 ### Competition Background
 
+**Competition Link:** [DrivenData - World Bank Poverty Prediction](https://www.drivendata.org/competitions/305/competition-worldbank-poverty/)
+
 - **Task**: Predict household-level consumption and aggregate poverty rates for test surveys
 - **Data**: 6 household surveys (~35,000 households each)
   - Training: Surveys 100000, 200000, 300000 (with consumption labels)
