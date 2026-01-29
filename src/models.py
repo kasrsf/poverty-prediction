@@ -17,6 +17,11 @@ from config import (
     RANDOM_SEED,
 )
 
+# Quantiles for distribution modeling
+QUANTILES = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40,
+             0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80,
+             0.85, 0.90, 0.95]
+
 
 class BaseModelWrapper:
     """Base wrapper for gradient boosting models."""
@@ -211,6 +216,271 @@ def create_models(
     # Update names to be unique
     for i, model in enumerate(models):
         model.name = f"{model.name}_{i}"
+
+    return models
+
+
+# =============================================================================
+# Quantile Regression Models
+# =============================================================================
+
+class QuantileModelWrapper:
+    """Base wrapper for quantile regression models.
+
+    Trains multiple models, one for each quantile, to estimate the full
+    conditional distribution of consumption.
+    """
+
+    def __init__(
+        self,
+        quantiles: list[float] | None = None,
+        use_log_target: bool = True,
+        name: str = "quantile_model"
+    ):
+        self.quantiles = quantiles if quantiles is not None else QUANTILES
+        self.use_log_target = use_log_target
+        self.name = name
+        self.models = {}  # Dict mapping quantile -> model
+        self.feature_cols = None
+
+    def _create_single_model(self, quantile: float) -> Any:
+        """Create a single quantile model. Override in subclasses."""
+        raise NotImplementedError
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        feature_cols: list[str] | None = None,
+        verbose: bool = True,
+        **fit_params
+    ) -> "QuantileModelWrapper":
+        """Fit quantile models for all quantiles.
+
+        Args:
+            X: Features DataFrame
+            y: Target series
+            feature_cols: List of feature columns to use
+            verbose: Whether to print progress
+            **fit_params: Additional parameters for fit()
+        """
+        if feature_cols is None:
+            feature_cols = X.columns.tolist()
+
+        self.feature_cols = feature_cols
+        X_fit = X[feature_cols]
+
+        if self.use_log_target:
+            y_fit = np.log1p(y)
+        else:
+            y_fit = y
+
+        for i, q in enumerate(self.quantiles):
+            if verbose:
+                print(f"  Training quantile {q:.2f} ({i+1}/{len(self.quantiles)})...")
+
+            model = self._create_single_model(q)
+            model.fit(X_fit, y_fit, **fit_params)
+            self.models[q] = model
+
+        return self
+
+    def predict(self, X: pd.DataFrame) -> dict[float, np.ndarray]:
+        """Predict quantiles for all data points.
+
+        Args:
+            X: Features DataFrame
+
+        Returns:
+            Dict mapping quantile -> predictions array
+        """
+        X_pred = X[self.feature_cols]
+        predictions = {}
+
+        for q, model in self.models.items():
+            y_pred = model.predict(X_pred)
+            if self.use_log_target:
+                y_pred = np.expm1(y_pred)
+            predictions[q] = np.clip(y_pred, 0.1, None)
+
+        return predictions
+
+    def predict_mean(self, X: pd.DataFrame) -> np.ndarray:
+        """Predict mean consumption (average of quantile predictions)."""
+        quantile_preds = self.predict(X)
+        return np.mean(list(quantile_preds.values()), axis=0)
+
+    def predict_median(self, X: pd.DataFrame) -> np.ndarray:
+        """Predict median consumption (0.5 quantile)."""
+        X_pred = X[self.feature_cols]
+        if 0.5 not in self.models:
+            # Use closest quantile to 0.5
+            closest_q = min(self.quantiles, key=lambda q: abs(q - 0.5))
+            model = self.models[closest_q]
+        else:
+            model = self.models[0.5]
+
+        y_pred = model.predict(X_pred)
+        if self.use_log_target:
+            y_pred = np.expm1(y_pred)
+        return np.clip(y_pred, 0.1, None)
+
+    def save(self, path: str | None = None) -> None:
+        """Save all quantile models to disk."""
+        if path is None:
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            path = MODELS_DIR / f"{self.name}.pkl"
+
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+    @classmethod
+    def load(cls, path: str) -> "QuantileModelWrapper":
+        """Load quantile models from disk."""
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+
+class QuantileLightGBM(QuantileModelWrapper):
+    """LightGBM quantile regression model."""
+
+    def __init__(
+        self,
+        quantiles: list[float] | None = None,
+        n_estimators: int = 1000,
+        use_log_target: bool = True,
+        params: dict | None = None,
+        random_state: int | None = None
+    ):
+        super().__init__(quantiles, use_log_target, name="quantile_lightgbm")
+        self.n_estimators = n_estimators
+        self.base_params = LIGHTGBM_PARAMS.copy()
+        if params:
+            self.base_params.update(params)
+        self.base_params["n_estimators"] = n_estimators
+        if random_state is not None:
+            self.base_params["random_state"] = random_state
+        # Remove regression-specific params
+        self.base_params.pop("objective", None)
+        self.base_params.pop("metric", None)
+
+    def _create_single_model(self, quantile: float) -> LGBMRegressor:
+        """Create LightGBM model with quantile loss."""
+        params = self.base_params.copy()
+        params["objective"] = "quantile"
+        params["alpha"] = quantile
+        return LGBMRegressor(**params)
+
+
+class QuantileXGBoost(QuantileModelWrapper):
+    """XGBoost quantile regression model."""
+
+    def __init__(
+        self,
+        quantiles: list[float] | None = None,
+        n_estimators: int = 1000,
+        use_log_target: bool = True,
+        params: dict | None = None,
+        random_state: int | None = None
+    ):
+        super().__init__(quantiles, use_log_target, name="quantile_xgboost")
+        self.n_estimators = n_estimators
+        self.base_params = XGBOOST_PARAMS.copy()
+        if params:
+            self.base_params.update(params)
+        self.base_params["n_estimators"] = n_estimators
+        if random_state is not None:
+            self.base_params["random_state"] = random_state
+        # Remove regression-specific params
+        self.base_params.pop("objective", None)
+        self.base_params.pop("eval_metric", None)
+
+    def _create_single_model(self, quantile: float) -> XGBRegressor:
+        """Create XGBoost model with quantile loss."""
+        params = self.base_params.copy()
+        params["objective"] = "reg:quantileerror"
+        params["quantile_alpha"] = quantile
+        return XGBRegressor(**params)
+
+
+class QuantileCatBoost(QuantileModelWrapper):
+    """CatBoost quantile regression model."""
+
+    def __init__(
+        self,
+        quantiles: list[float] | None = None,
+        n_estimators: int = 1000,
+        use_log_target: bool = True,
+        params: dict | None = None,
+        random_state: int | None = None
+    ):
+        super().__init__(quantiles, use_log_target, name="quantile_catboost")
+        self.n_estimators = n_estimators
+        self.base_params = CATBOOST_PARAMS.copy()
+        if params:
+            self.base_params.update(params)
+        self.base_params["iterations"] = n_estimators
+        if random_state is not None:
+            self.base_params["random_seed"] = random_state
+        # Remove regression-specific params
+        self.base_params.pop("loss_function", None)
+
+    def _create_single_model(self, quantile: float) -> CatBoostRegressor:
+        """Create CatBoost model with quantile loss."""
+        params = self.base_params.copy()
+        params["loss_function"] = f"Quantile:alpha={quantile}"
+        return CatBoostRegressor(**params)
+
+
+def create_quantile_models(
+    n_estimators: int = 1000,
+    use_log_target: bool = True,
+    quantiles: list[float] | None = None,
+    model_types: list[str] | None = None,
+    random_state: int | None = None
+) -> list[QuantileModelWrapper]:
+    """Create quantile regression models for ensembling.
+
+    Args:
+        n_estimators: Number of boosting rounds
+        use_log_target: Whether to use log-transformed target
+        quantiles: List of quantiles to predict (default: 0.05 to 0.95)
+        model_types: List of model types to create (default: all)
+        random_state: Random seed
+
+    Returns:
+        List of quantile model wrappers
+    """
+    if model_types is None:
+        model_types = ["lightgbm", "xgboost", "catboost"]
+
+    if random_state is None:
+        random_state = RANDOM_SEED
+
+    models = []
+
+    for model_type in model_types:
+        if model_type == "lightgbm":
+            models.append(QuantileLightGBM(
+                quantiles=quantiles,
+                n_estimators=n_estimators,
+                use_log_target=use_log_target,
+                random_state=random_state
+            ))
+        elif model_type == "xgboost":
+            models.append(QuantileXGBoost(
+                quantiles=quantiles,
+                n_estimators=n_estimators,
+                use_log_target=use_log_target,
+                random_state=random_state
+            ))
+        elif model_type == "catboost":
+            models.append(QuantileCatBoost(
+                quantiles=quantiles,
+                n_estimators=n_estimators,
+                use_log_target=use_log_target,
+                random_state=random_state
+            ))
 
     return models
 

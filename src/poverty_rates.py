@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from config import POVERTY_THRESHOLDS, POVERTY_RATE_COLS, THRESHOLD_TO_STR
-from metrics import calculate_poverty_rates, validate_rates
+from config import POVERTY_THRESHOLDS, POVERTY_RATE_COLS, THRESHOLD_TO_STR, TRAIN_SURVEYS
+from metrics import calculate_poverty_rates, validate_rates, get_true_rates_for_survey
 
 
 def calculate_survey_rates(
@@ -193,6 +193,289 @@ def ensure_monotonic_rates(rates: dict[float, float]) -> dict[float, float]:
         adjusted_rates[t] = min(adjusted_rates[t], 1.0)
 
     return adjusted_rates
+
+
+class SurveySpecificCalibrator:
+    """Calibrate predictions using survey-specific distribution adjustments.
+
+    This calibrator matches test surveys to similar training surveys and
+    applies survey-specific corrections to improve poverty rate predictions.
+    """
+
+    def __init__(self, thresholds: list[float] | None = None):
+        self.thresholds = thresholds or POVERTY_THRESHOLDS
+        self.train_survey_stats = {}
+        self.train_rates = {}
+        self.feature_cols = None
+
+    def fit(
+        self,
+        X_train: pd.DataFrame,
+        y_train: np.ndarray,
+        weights_train: np.ndarray,
+        rates_df: pd.DataFrame,
+        feature_cols: list[str] | None = None
+    ) -> "SurveySpecificCalibrator":
+        """Fit calibrator on training data.
+
+        Args:
+            X_train: Training features (must have survey_id column)
+            y_train: Training target values
+            weights_train: Training sample weights
+            rates_df: Ground truth poverty rates DataFrame
+            feature_cols: Feature columns to use for similarity matching
+
+        Returns:
+            Self for chaining
+        """
+        self.feature_cols = feature_cols
+
+        for survey_id in TRAIN_SURVEYS:
+            mask = X_train["survey_id"] == survey_id
+            survey_y = y_train[mask] if isinstance(y_train, np.ndarray) else y_train[mask].values
+            survey_w = weights_train[mask] if isinstance(weights_train, np.ndarray) else weights_train[mask].values
+
+            # Calculate distribution statistics
+            self.train_survey_stats[survey_id] = {
+                "mean": np.average(survey_y, weights=survey_w),
+                "median": self._weighted_median(survey_y, survey_w),
+                "std": np.sqrt(np.average((survey_y - np.average(survey_y, weights=survey_w))**2, weights=survey_w)),
+                "skewness": stats.skew(survey_y),
+                "p25": self._weighted_percentile(survey_y, survey_w, 25),
+                "p75": self._weighted_percentile(survey_y, survey_w, 75),
+                "p90": self._weighted_percentile(survey_y, survey_w, 90),
+            }
+
+            # Store true rates
+            self.train_rates[survey_id] = get_true_rates_for_survey(rates_df, survey_id)
+
+            # Store feature statistics if available
+            if feature_cols is not None:
+                survey_X = X_train.loc[mask, feature_cols]
+                self.train_survey_stats[survey_id]["feature_means"] = survey_X.mean().values
+
+        return self
+
+    def _weighted_median(self, values: np.ndarray, weights: np.ndarray) -> float:
+        """Calculate weighted median."""
+        sorted_idx = np.argsort(values)
+        sorted_values = values[sorted_idx]
+        sorted_weights = weights[sorted_idx]
+        cum_weights = np.cumsum(sorted_weights) / np.sum(sorted_weights)
+        return sorted_values[np.searchsorted(cum_weights, 0.5)]
+
+    def _weighted_percentile(self, values: np.ndarray, weights: np.ndarray, percentile: float) -> float:
+        """Calculate weighted percentile."""
+        sorted_idx = np.argsort(values)
+        sorted_values = values[sorted_idx]
+        sorted_weights = weights[sorted_idx]
+        cum_weights = np.cumsum(sorted_weights) / np.sum(sorted_weights)
+        return sorted_values[np.searchsorted(cum_weights, percentile / 100)]
+
+    def find_similar_survey(
+        self,
+        X_test: pd.DataFrame,
+        predictions: np.ndarray,
+        weights: np.ndarray
+    ) -> int:
+        """Find the training survey most similar to test data.
+
+        Args:
+            X_test: Test features for one survey
+            predictions: Predictions for test survey
+            weights: Sample weights
+
+        Returns:
+            Most similar training survey ID
+        """
+        # Calculate test survey statistics
+        test_stats = {
+            "mean": np.average(predictions, weights=weights),
+            "median": self._weighted_median(predictions, weights),
+            "std": np.sqrt(np.average((predictions - np.average(predictions, weights=weights))**2, weights=weights)),
+            "skewness": stats.skew(predictions),
+            "p25": self._weighted_percentile(predictions, weights, 25),
+            "p75": self._weighted_percentile(predictions, weights, 75),
+            "p90": self._weighted_percentile(predictions, weights, 90),
+        }
+
+        # Find most similar training survey
+        best_survey = None
+        best_distance = float("inf")
+
+        for survey_id, train_stats in self.train_survey_stats.items():
+            # Calculate similarity based on distribution statistics
+            distance = 0
+            for stat in ["mean", "median", "std", "p25", "p75", "p90"]:
+                # Normalized difference
+                if train_stats[stat] > 0:
+                    distance += abs(test_stats[stat] - train_stats[stat]) / train_stats[stat]
+
+            # Add feature-based similarity if available
+            if self.feature_cols is not None and "feature_means" in train_stats:
+                test_feature_means = X_test[self.feature_cols].mean().values
+                feature_distance = np.mean(np.abs(test_feature_means - train_stats["feature_means"]))
+                distance += feature_distance * 0.5
+
+            if distance < best_distance:
+                best_distance = distance
+                best_survey = survey_id
+
+        return best_survey
+
+    def transform(
+        self,
+        predictions: np.ndarray,
+        X_test: pd.DataFrame,
+        weights: np.ndarray
+    ) -> np.ndarray:
+        """Apply survey-specific calibration.
+
+        Args:
+            predictions: Model predictions for one survey
+            X_test: Test features for the survey
+            weights: Sample weights
+
+        Returns:
+            Calibrated predictions
+        """
+        # Find similar training survey
+        similar_survey = self.find_similar_survey(X_test, predictions, weights)
+
+        # Get calibration parameters from similar survey
+        similar_stats = self.train_survey_stats[similar_survey]
+        similar_rates = self.train_rates[similar_survey]
+
+        # Calculate current statistics
+        pred_mean = np.average(predictions, weights=weights)
+        pred_median = self._weighted_median(predictions, weights)
+
+        # Apply mean/median-matching calibration
+        target_mean = similar_stats["mean"]
+        scale_factor = target_mean / pred_mean if pred_mean > 0 else 1.0
+
+        # Constrain scale factor
+        scale_factor = np.clip(scale_factor, 0.8, 1.2)
+
+        calibrated = predictions * scale_factor
+
+        # Additional adjustment for skewness (upper tail)
+        if similar_stats["skewness"] > stats.skew(calibrated):
+            # Predictions are too compressed, expand upper tail
+            median_pred = np.median(calibrated)
+            upper_mask = calibrated > median_pred
+            expansion_factor = 1.05  # Mild expansion
+            calibrated[upper_mask] = median_pred + (calibrated[upper_mask] - median_pred) * expansion_factor
+
+        return np.clip(calibrated, 0.1, None)
+
+    def transform_by_survey(
+        self,
+        predictions: np.ndarray,
+        X_test: pd.DataFrame,
+        weights: np.ndarray,
+        survey_ids: np.ndarray
+    ) -> np.ndarray:
+        """Apply survey-specific calibration to multiple test surveys.
+
+        Args:
+            predictions: All predictions
+            X_test: All test features
+            weights: All sample weights
+            survey_ids: Survey IDs for each prediction
+
+        Returns:
+            Calibrated predictions
+        """
+        calibrated = predictions.copy()
+
+        for survey_id in np.unique(survey_ids):
+            mask = survey_ids == survey_id
+            survey_preds = predictions[mask]
+            survey_X = X_test[mask]
+            survey_weights = weights[mask]
+
+            calibrated[mask] = self.transform(survey_preds, survey_X, survey_weights)
+
+        return calibrated
+
+
+class RateMatchingCalibrator:
+    """Calibrate predictions to match expected poverty rate patterns.
+
+    This calibrator directly optimizes predictions to match the distribution
+    of poverty rates observed in training surveys.
+    """
+
+    def __init__(self, thresholds: list[float] | None = None):
+        self.thresholds = thresholds or POVERTY_THRESHOLDS
+        self.train_rate_patterns = {}
+
+    def fit(
+        self,
+        rates_df: pd.DataFrame
+    ) -> "RateMatchingCalibrator":
+        """Fit calibrator on training poverty rates.
+
+        Args:
+            rates_df: Ground truth poverty rates DataFrame
+
+        Returns:
+            Self for chaining
+        """
+        for survey_id in TRAIN_SURVEYS:
+            rates = get_true_rates_for_survey(rates_df, survey_id)
+            self.train_rate_patterns[survey_id] = rates
+
+        # Calculate average rate pattern
+        avg_rates = {}
+        for t in self.thresholds:
+            avg_rates[t] = np.mean([
+                self.train_rate_patterns[s][t] for s in TRAIN_SURVEYS
+            ])
+        self.train_rate_patterns["average"] = avg_rates
+
+        return self
+
+    def transform(
+        self,
+        predictions: np.ndarray,
+        weights: np.ndarray,
+        target_pattern: str | int = "average"
+    ) -> np.ndarray:
+        """Adjust predictions to match target rate pattern.
+
+        Args:
+            predictions: Model predictions
+            weights: Sample weights
+            target_pattern: 'average' or specific survey ID
+
+        Returns:
+            Calibrated predictions
+        """
+        target_rates = self.train_rate_patterns.get(target_pattern)
+        if target_rates is None:
+            target_rates = self.train_rate_patterns["average"]
+
+        # Calculate current rates
+        current_rates = calculate_poverty_rates(predictions, weights, self.thresholds)
+
+        # Find key threshold (closest to 40%)
+        key_threshold = min(self.thresholds, key=lambda t: abs(current_rates[t] - 0.4))
+        rate_diff = target_rates[key_threshold] - current_rates[key_threshold]
+
+        # Apply adjustment
+        # If we're overpredicting poverty (rate too high), scale up predictions
+        # If underpredicting poverty (rate too low), scale down
+        if rate_diff > 0.05:  # Underpredicting poverty
+            scale_factor = 0.95
+        elif rate_diff < -0.05:  # Overpredicting poverty
+            scale_factor = 1.05
+        else:
+            scale_factor = 1.0
+
+        calibrated = predictions * scale_factor
+        return np.clip(calibrated, 0.1, None)
 
 
 def create_poverty_submission(
